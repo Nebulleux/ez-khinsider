@@ -5,7 +5,7 @@ echo This script was created by the great Nebulleux - OST are from [https://down
 
 pause
 
-set /p site="Put the website url here | Entrez l'url de l'ost voulue svp : "
+set /p site="Please enter the url of the desired ost | Entrez l'url de l'ost voulue svp : "
 
 set /p format="Put the desired format (mp3,m4a,flac)| Entrez le format voulu (mp3,m4a,flac): "
 
