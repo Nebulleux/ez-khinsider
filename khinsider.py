@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
@@ -12,6 +11,7 @@ import os
 import re
 import sys
 from functools import wraps
+from itertools import chain
 
 try:
     from urllib.parse import unquote, urljoin, urlsplit
@@ -127,6 +127,16 @@ BASE_URL = 'https://downloads.khinsider.com/'
 # Although some of these are valid on Linux, keeping this the same
 # across systems is nice for consistency AND it works on WSL.
 FILENAME_INVALID_RE = re.compile(r'[<>:"/\\|?*]')
+def to_valid_filename(s):
+    # Windows's Explorer doens't handle filenames that end in ' ' or '.'.
+    s = s.rstrip(' .')
+
+    if s in {'', '.', '..', '~', 'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2',
+             'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1',
+             'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'}:
+        return s + '_'
+
+    return FILENAME_INVALID_RE.sub('-', s)
 
 
 # Different printin' for different Pythons.
@@ -156,15 +166,18 @@ def getSoup(*args, **kwargs):
     r = requests.get(*args, **kwargs)
     return toSoup(r)
 
-
+REMOVE_RE = re.compile(br"^</td>\s*$", re.MULTILINE)
+BAD_AMPERSAND_RE = re.compile(br"&#([^0-9x]|x[^0-9A-Fa-f])")
 def toSoup(r):
-    # Fix errors in khinsider's HTML
-    removeRe = re.compile(br"^</td>\s*$", re.MULTILINE)
-    
+    content = r.content
+    # Fix errors in khinsider's HTML.
+    content = REMOVE_RE.sub(b'', content)
+    content = BAD_AMPERSAND_RE.sub(b'&amp;#\1', content)
+
     # BS4 outputs unsuppressable error messages when it can't
     # decode the input bytes properly. This... suppresses them.
     with Silence():
-        return BeautifulSoup(re.sub(removeRe, b'', r.content), 'html.parser')
+        return BeautifulSoup(content, 'html.parser')
 
 
 def getAppropriateFile(song, formatOrder):
@@ -184,6 +197,11 @@ def friendlyDownloadFile(file, path, index, total, verbose=False):
         str(index).zfill(len(str(total))),
         str(total)
     )
+
+    if file is None and verbose:
+        print("Song {} is nonexistent (404: Not Found). Skipping over.".format(numberStr), file=sys.stderr)
+        return False
+
     encoding = sys.getfilesystemencoding()
     # Fun(?) fact: on Python 2, sys.getfilesystemencoding returns 'mbcs' even
     # on Windows NT (1993!) and later where filenames are natively Unicode.
@@ -194,7 +212,7 @@ def friendlyDownloadFile(file, path, index, total, verbose=False):
     if filename != file.filename:
         byTheWay = " (replaced characters not in the filesystem's \"{}\" encoding)".format(encoding)
     
-    filename = FILENAME_INVALID_RE.sub('-', filename)
+    filename = to_valid_filename(filename)
     path = os.path.join(path, filename)
     
     if not os.path.exists(path):
@@ -221,6 +239,9 @@ def friendlyDownloadFile(file, path, index, total, verbose=False):
 
 
 class KhinsiderError(Exception):
+    pass
+
+class NonexistentSongError(KhinsiderError):
     pass
 
 class SoundtrackError(Exception):
@@ -250,6 +271,7 @@ class Soundtrack(object):
     Properties:
     * id:     The soundtrack's unique ID, used at the end of its URL.
     * url:    The full URL of the soundtrack.
+    * name:   The textual title of the soundtrack.
     * availableFormats: A list of the formats the soundtrack is available in.
     * songs:  A list of Song objects representing the songs in the soundtrack.
     * images: A list of File objects representing the images in the soundtrack.
@@ -268,12 +290,16 @@ class Soundtrack(object):
     @lazyProperty
     def _contentSoup(self):
         soup = getSoup(self.url)
-        contentSoup = soup.find(id='EchoTopic')
+        contentSoup = soup.find(id='pageContent')
         if contentSoup.find('p').string == "No such album":
-            # The EchoTopic and p exist even if the soundtrack doesn't, so no
+            # The pageContent and p exist even if the soundtrack doesn't, so no
             # need for error handling here.
             raise NonexistentSoundtrackError(self)
         return contentSoup
+
+    @lazyProperty
+    def name(self):
+        return next(self._contentSoup.find('h2').stripped_strings)
 
     @lazyProperty
     def availableFormats(self):
@@ -294,9 +320,15 @@ class Soundtrack(object):
     
     @lazyProperty
     def images(self):
-        anchors = [a for a in self._contentSoup('p')[1]('a') if a.find('img')]
+        table = self._contentSoup.find('table')
+        if not table:
+            # Currently, the table is always present, but if it's ever removed
+            # for imageless albums, it should be handled gracefully.
+            return []
+        anchors = [a for a in table('a') if a.find('img')]
         urls = [a['href'] for a in anchors]
         images = [File(urljoin(self.url, url)) for url in urls]
+        print(images)
         return images
 
     def download(self, path='', makeDirs=True, formatOrder=None, verbose=False):
@@ -324,7 +356,10 @@ class Soundtrack(object):
             print("Getting song list...")
         files = []
         for song in self.songs:
-            files.append(getAppropriateFile(song, formatOrder))
+            try:
+                files.append(getAppropriateFile(song, formatOrder))
+            except NonexistentSongError:
+                files.append(None)
         files.extend(self.images)
         totalFiles = len(files)
 
@@ -357,6 +392,9 @@ class Song(object):
     
     @lazyProperty
     def _soup(self):
+        r = requests.get(self.url, timeout=10)
+        if r.url.rsplit('/', 1)[-1] == '404':
+            raise NonexistentSongError("Nonexistent song page (404).")
         return getSoup(self.url)
 
     @lazyProperty
@@ -411,27 +449,68 @@ def download(soundtrackId, path='', makeDirs=True, formatOrder=None, verbose=Fal
     """Download the soundtrack with the ID `soundtrackId`.
     See Soundtrack.download for more information.
     """
-    return Soundtrack(soundtrackId).download(path, makeDirs, formatOrder, verbose)
+    soundtrack = Soundtrack(soundtrackId)
+    soundtrack.name # To conistently always load the content in advance.
+    path = to_valid_filename(soundtrack.name) if path is None else path
+    if verbose:
+        unicodePrint("Downloading to \"{}\".".format(path))
+    return soundtrack.download(path, makeDirs, formatOrder, verbose)
 
 
 class SearchError(KhinsiderError):
     pass
 
+
 def search(term):
-    """Return a list of Soundtrack objects for the search term `term`."""
+    """Return a tuple of two lists of Soundtrack objects for the search term
+    `term`. The first tuple contains album name results, and the second song
+    name results.
+    """
     r = requests.get(urljoin(BASE_URL, 'search'), params={'search': term})
     path = urlsplit(r.url).path
     if path.split('/', 2)[1] == 'game-soundtracks':
         return [Soundtrack(path.rsplit('/', 1)[-1])]
 
     soup = toSoup(r)
-    try:
-        anchors = soup('p')[1]('a')
-    except IndexError:
-        raise SearchError(soup.find('p').get_text(strip=True))
-    soundtrackIds = [a['href'].split('/')[-1] for a in anchors]
 
-    return [Soundtrack(id) for id in soundtrackIds]
+    tables = soup('table', class_='albumList')
+    if not tables:
+        raise SearchError(soup.find('p').get_text(strip=True))
+
+    soundtracks = [soundtracksInSearchTable(table) for table in tables]
+    if len(soundtracks) == 1:
+        if "song" in soup.find(id='pageContent').find('p').get_text():
+            soundtracks.insert(0, [])
+        else:
+            soundtracks.append([])
+
+    return soundtracks
+
+def soundtracksInSearchTable(table):
+    anchors = (tr('td')[1].find('a') for tr in table('tr')[1:])
+    soundtrackParams = [(a['href'].split('/')[-1], a.get_text(strip=True)) for a in anchors]
+
+    soundtracks = []
+    for id, name in soundtrackParams:
+        curSoundtrack = Soundtrack(id)
+        curSoundtrack._lazy_name = name
+        soundtracks.append(curSoundtrack)
+
+    return soundtracks
+
+def printSearchResults(searchResults, file=sys.stdout):
+    padLen = max(len(x.id) for x in chain(*searchResults))
+    s = ""
+    hasPreviousList = False
+    for heading, soundtracks in zip(("Album title results:", "Song name results:"), searchResults):
+        if soundtracks:
+            if hasPreviousList:
+                s += "\n"
+            s += heading + "\n"
+            for soundtrack in soundtracks:
+                s += "{} {}. {}\n".format(soundtrack.id, '.' * (padLen - len(soundtrack.id)), soundtrack.name)
+            hasPreviousList = True
+    unicodePrint(s, end="", file=file)
 
 # --- And now for the execution. ---
 
@@ -439,6 +518,8 @@ if __name__ == '__main__':
     import argparse
 
     SCRIPT_NAME = os.path.split(sys.argv[0])[-1]
+    REPORT_STR = ("If it isn't too much to ask, please report to "
+                  "https://github.com/obskyr/khinsider/issues.")
 
     # Tiny details!
     class KindArgumentParser(argparse.ArgumentParser):
@@ -506,7 +587,7 @@ if __name__ == '__main__':
         m = urlRe.match(soundtrack)
         soundtrack = m.group('soundtrack') if m is not None else soundtrack
 
-        outPath = arguments.outPath if arguments.outPath is not None else soundtrack
+        outPath = arguments.outPath # Can be None; handled in download().
 
         # I think this makes the most sense for people who aren't used to the
         # command line - this'll yield useful results even if you just type
@@ -530,13 +611,16 @@ if __name__ == '__main__':
                 try:
                     searchResults = search(searchTerm)
                 except SearchError as e:
-                    print("Couldn't search. {}".format(e.args[0]), file=sys.stderr)
+                    if re.match(r"^Found [0-9]+ matching albums.$", e.args[0]):
+                        errorStr = "Couldn't search! {}".format(REPORT_STR)
+                    else:
+                        errorStr = "Couldn't search. {}".format(e.args[0])
+                    print(errorStr, file=sys.stderr)
                 else:
                     if searchResults:
                         print("Soundtracks found (to download, "
-                              "run \"{} soundtrack-name\"):".format(SCRIPT_NAME))
-                        for soundtrack in searchResults:
-                            print(soundtrack.id)
+                              "run \"{} soundtrack-name\")!\n".format(SCRIPT_NAME))
+                        printSearchResults(searchResults)
                     else:
                         print("No soundtracks found.")
             else:
@@ -554,8 +638,7 @@ if __name__ == '__main__':
 
                     if searchResults: # aww yeah we gon' do some searchin'
                         print("\nThese exist, though:", file=sys.stderr)
-                        for soundtrack in searchResults:
-                            print(soundtrack.id, file=sys.stderr)
+                        printSearchResults(searchResults, file=sys.stderr)
                     elif searchResults is None:
                         print("A search for \"{}\" could not be performed either. "
                               "It may be too short.".format(searchTerm), file=sys.stderr)
@@ -587,9 +670,7 @@ if __name__ == '__main__':
             return 1
         except Exception:
             print(file=sys.stderr)
-            print("An unexpected error occurred! "
-                  "If it isn't too much to ask, please report to "
-                  "https://github.com/obskyr/khinsider/issues.",
+            print("An unexpected error occurred! " + REPORT_STR,
                   file=sys.stderr)
             print("Attach the following error message:", file=sys.stderr)
             print(file=sys.stderr)
